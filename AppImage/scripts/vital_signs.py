@@ -22,17 +22,20 @@ MEMORY_INTERVAL = 30
 def refresh_intervals():
     """Refresh sampling intervals from health_thresholds if configured."""
     global CPU_INTERVAL, TEMPERATURE_INTERVAL, MEMORY_INTERVAL
+
+    def _clean(val, default, min_val=1):
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            return default
+        return max(min_val, int(val))
+
     try:
         import health_thresholds as _ht
         cpu_val = _ht.get("sampling_intervals", "cpu", default=5)
         temp_val = _ht.get("sampling_intervals", "temperature", default=15)
         mem_val = _ht.get("sampling_intervals", "memory", default=30)
-        if cpu_val is not None:
-            CPU_INTERVAL = int(cpu_val)
-        if temp_val is not None:
-            TEMPERATURE_INTERVAL = int(temp_val)
-        if mem_val is not None:
-            MEMORY_INTERVAL = int(mem_val)
+        CPU_INTERVAL = _clean(cpu_val, 5, min_val=1)
+        TEMPERATURE_INTERVAL = _clean(temp_val, 15, min_val=1)
+        MEMORY_INTERVAL = _clean(mem_val, 30, min_val=1)
     except Exception:
         pass
 

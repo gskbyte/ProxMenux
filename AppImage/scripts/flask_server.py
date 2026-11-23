@@ -1667,6 +1667,9 @@ def _health_collector_loop():
         time.sleep(300)  # Every 5 minutes
 
 
+_vital_signs_wake_event = threading.Event()
+
+
 def _vital_signs_sampler():
     """Dedicated thread that reads CPU, memory and temperature for the whole Monitor.
 
@@ -1697,6 +1700,11 @@ def _vital_signs_sampler():
             vital_signs.refresh_intervals()
             now = time.monotonic()
 
+            # Clamp deadlines if an interval was shortened while asleep
+            next_cpu = min(next_cpu, now + vital_signs.CPU_INTERVAL)
+            next_temp = min(next_temp, now + vital_signs.TEMPERATURE_INTERVAL)
+            next_mem = min(next_mem, now + vital_signs.MEMORY_INTERVAL)
+
             if now >= next_temp:
                 health_monitor._sample_cpu_temperature()
                 next_temp = now + vital_signs.TEMPERATURE_INTERVAL
@@ -1709,9 +1717,11 @@ def _vital_signs_sampler():
                 health_monitor._sample_memory_usage()
                 next_mem = now + vital_signs.MEMORY_INTERVAL
 
-            # Sleep until the next earliest event (with 0.5s min to avoid busy-loop)
+            # Sleep until the next earliest event (with 0.5s min to avoid busy-loop),
+            # or until woken early by a threshold update.
             sleep_until = min(next_temp, next_cpu, next_mem) - time.monotonic()
-            time.sleep(max(sleep_until, 0.5))
+            _vital_signs_wake_event.wait(timeout=max(sleep_until, 0.5))
+            _vital_signs_wake_event.clear()
         except Exception as e:
             print(f"[ProxMenux] Vital signs sampler error: {e}")
             time.sleep(10)
@@ -15290,6 +15300,7 @@ def api_health_thresholds_put():
         try:
             effective = ht.save(payload)
             vital_signs.refresh_intervals()
+            _vital_signs_wake_event.set()
         except ht.ThresholdValidationError as e:
             return jsonify({'success': False, 'message': str(e)}), 400
         return jsonify({'success': True, 'thresholds': effective})
@@ -15311,6 +15322,7 @@ def api_health_thresholds_reset():
             else:
                 effective = ht.reset_all()
             vital_signs.refresh_intervals()
+            _vital_signs_wake_event.set()
         except ht.ThresholdValidationError as e:
             return jsonify({'success': False, 'message': str(e)}), 400
         return jsonify({'success': True, 'thresholds': effective})

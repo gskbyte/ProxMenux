@@ -263,9 +263,9 @@ const SECTIONS: SectionDef[] = [
     description:
       "Cadence for the background Vital Signs sampler. Higher values reduce CPU usage and database disk writes; lower values provide faster real-time updates.",
     fields: [
-      { path: ["sampling_intervals", "cpu"], label: "CPU sampling interval" },
-      { path: ["sampling_intervals", "temperature"], label: "Temperature sampling interval" },
-      { path: ["sampling_intervals", "memory"], label: "Memory sampling interval" },
+      { path: ["sampling_intervals", "cpu"], label: "CPU interval" },
+      { path: ["sampling_intervals", "temperature"], label: "Temperature interval" },
+      { path: ["sampling_intervals", "memory"], label: "Memory interval" },
     ],
   },
 ]
