@@ -1683,32 +1683,31 @@ def _vital_signs_sampler():
     # Wait 15s after startup for sensors to be ready
     time.sleep(15)
 
-    TEMP_INTERVAL = vital_signs.TEMPERATURE_INTERVAL
-    CPU_INTERVAL = vital_signs.CPU_INTERVAL
-    MEM_INTERVAL = vital_signs.MEMORY_INTERVAL
+    vital_signs.refresh_intervals()
 
     # Stagger: CPU starts immediately, Temp after 7s, Mem after 15s
     next_cpu  = time.monotonic()
     next_temp = time.monotonic() + 7
     next_mem  = time.monotonic() + 15
 
-    print(f"[ProxMenux] Vital signs sampler started (CPU: {CPU_INTERVAL}s, Mem: {MEM_INTERVAL}s, Temp: {TEMP_INTERVAL}s)")
+    print(f"[ProxMenux] Vital signs sampler started (CPU: {vital_signs.CPU_INTERVAL}s, Mem: {vital_signs.MEMORY_INTERVAL}s, Temp: {vital_signs.TEMPERATURE_INTERVAL}s)")
 
     while True:
         try:
+            vital_signs.refresh_intervals()
             now = time.monotonic()
 
             if now >= next_temp:
                 health_monitor._sample_cpu_temperature()
-                next_temp = now + TEMP_INTERVAL
+                next_temp = now + vital_signs.TEMPERATURE_INTERVAL
 
             if now >= next_cpu:
                 health_monitor._sample_cpu_usage()
-                next_cpu = now + CPU_INTERVAL
+                next_cpu = now + vital_signs.CPU_INTERVAL
 
             if now >= next_mem:
                 health_monitor._sample_memory_usage()
-                next_mem = now + MEM_INTERVAL
+                next_mem = now + vital_signs.MEMORY_INTERVAL
 
             # Sleep until the next earliest event (with 0.5s min to avoid busy-loop)
             sleep_until = min(next_temp, next_cpu, next_mem) - time.monotonic()
@@ -15290,6 +15289,7 @@ def api_health_thresholds_put():
             return jsonify({'success': False, 'message': 'Body must be a JSON object'}), 400
         try:
             effective = ht.save(payload)
+            vital_signs.refresh_intervals()
         except ht.ThresholdValidationError as e:
             return jsonify({'success': False, 'message': str(e)}), 400
         return jsonify({'success': True, 'thresholds': effective})
@@ -15310,6 +15310,7 @@ def api_health_thresholds_reset():
                 effective = ht.reset_section(section)
             else:
                 effective = ht.reset_all()
+            vital_signs.refresh_intervals()
         except ht.ThresholdValidationError as e:
             return jsonify({'success': False, 'message': str(e)}), 400
         return jsonify({'success': True, 'thresholds': effective})

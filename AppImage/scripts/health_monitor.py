@@ -424,6 +424,7 @@ class HealthMonitor:
         except Exception:
             return
         try:
+            vital_signs.refresh_intervals()
             mapping = (
                 # (section, key) -> instance attribute on self
                 (("cpu", "warning"), "CPU_WARNING"),

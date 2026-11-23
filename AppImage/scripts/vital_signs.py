@@ -18,6 +18,27 @@ CPU_INTERVAL = 5
 TEMPERATURE_INTERVAL = 15
 MEMORY_INTERVAL = 30
 
+
+def refresh_intervals():
+    """Refresh sampling intervals from health_thresholds if configured."""
+    global CPU_INTERVAL, TEMPERATURE_INTERVAL, MEMORY_INTERVAL
+    try:
+        import health_thresholds as _ht
+        cpu_val = _ht.get("sampling_intervals", "cpu", default=5)
+        temp_val = _ht.get("sampling_intervals", "temperature", default=15)
+        mem_val = _ht.get("sampling_intervals", "memory", default=30)
+        if cpu_val is not None:
+            CPU_INTERVAL = int(cpu_val)
+        if temp_val is not None:
+            TEMPERATURE_INTERVAL = int(temp_val)
+        if mem_val is not None:
+            MEMORY_INTERVAL = int(mem_val)
+    except Exception:
+        pass
+
+
+refresh_intervals()
+
 # What a page that polls every few seconds accepts as current.
 LIVE_MAX_AGE = 5
 
