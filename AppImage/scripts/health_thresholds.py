@@ -139,6 +139,14 @@ DEFAULTS: dict[str, Any] = {
         "warning": {"value": 85, "unit": "%", "min": 1, "max": 100, "step": 1},
         "critical": {"value": 95, "unit": "%", "min": 1, "max": 100, "step": 1},
     },
+    "sampling_intervals": {
+        # Background sampling cadence for the Vital Signs collector.
+        # Lower values refresh metrics faster; higher values reduce
+        # background CPU wakeups on low-power hosts.
+        "cpu": {"value": 5, "unit": "s", "min": 1, "max": 300, "step": 1},
+        "temperature": {"value": 15, "unit": "s", "min": 5, "max": 300, "step": 1},
+        "memory": {"value": 30, "unit": "s", "min": 5, "max": 600, "step": 5},
+    },
 }
 
 
@@ -228,7 +236,7 @@ def get(section: str, *path: str, default: Optional[float] = None) -> Optional[f
             node = None
             break
         node = node.get(p)
-    if isinstance(node, (int, float)):
+    if isinstance(node, (int, float)) and not isinstance(node, bool):
         return float(node)
 
     # Fall back to recommended
@@ -241,7 +249,7 @@ def get(section: str, *path: str, default: Optional[float] = None) -> Optional[f
             return default
     if isinstance(node, dict) and "value" in node:
         return float(node["value"])
-    if isinstance(node, (int, float)):
+    if isinstance(node, (int, float)) and not isinstance(node, bool):
         return float(node)
     return default
 
@@ -262,7 +270,11 @@ def load_effective() -> dict:
     def merge(default_node: Any, override_node: Any) -> Any:
         if isinstance(default_node, dict) and "value" in default_node:
             # Leaf
-            ov = override_node if isinstance(override_node, (int, float)) else None
+            ov = (
+                override_node
+                if isinstance(override_node, (int, float)) and not isinstance(override_node, bool)
+                else None
+            )
             return {
                 **default_node,
                 "value": float(ov) if ov is not None else default_node["value"],
@@ -296,6 +308,11 @@ def _validate(section: str, path: tuple[str, ...], value: Any) -> float:
         meta = meta[p]
     if not isinstance(meta, dict) or "value" not in meta:
         raise ThresholdValidationError(f"Path {section}.{'.'.join(path)} is not a leaf")
+
+    if isinstance(value, bool):
+        raise ThresholdValidationError(
+            f"{section}.{'.'.join(path)} must be a number, got {value!r}"
+        )
 
     try:
         v = float(value)
@@ -414,8 +431,9 @@ def _check_warn_le_crit(merged: dict) -> None:
     it and DEFAULTS to resolve the effective values."""
 
     def effective(node_default: Any, node_over: Any, key: str) -> Optional[float]:
-        if isinstance(node_over, dict) and isinstance(node_over.get(key), (int, float)):
-            return float(node_over[key])
+        raw = node_over.get(key) if isinstance(node_over, dict) else None
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            return float(raw)
         leaf = node_default.get(key) if isinstance(node_default, dict) else None
         if isinstance(leaf, dict) and "value" in leaf:
             return float(leaf["value"])

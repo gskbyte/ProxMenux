@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useLayoutEffect, useRef, useState } from "react"
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react"
 import { useIsPbs } from "../lib/use-platform"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./ui/card"
 import { Input } from "./ui/input"
@@ -20,6 +20,7 @@ import {
   Database,
   Waves,
   Monitor,
+  Timer,
 } from "lucide-react"
 import { getApiUrl, getAuthToken } from "../lib/api-config"
 import { useT } from "../lib/i18n/provider"
@@ -99,6 +100,11 @@ interface ThresholdsTree {
   lxc_mount: { warning: ThresholdLeaf; critical: ThresholdLeaf }
   pve_storage: { warning: ThresholdLeaf; critical: ThresholdLeaf }
   zfs_pool: { warning: ThresholdLeaf; critical: ThresholdLeaf }
+  sampling_intervals?: {
+    cpu: ThresholdLeaf
+    temperature: ThresholdLeaf
+    memory: ThresholdLeaf
+  }
 }
 
 // Pending edits: { "section/key" : "76" } — kept as raw strings while
@@ -249,6 +255,19 @@ const SECTIONS: SectionDef[] = [
       { path: ["zfs_pool", "critical"], label: "Critical" },
     ],
   },
+  // ── Telemetry & Performance ────────────────────────────────────
+  {
+    id: "sampling_intervals",
+    title: "Sampling intervals",
+    icon: Timer,
+    description:
+      "How often the Vital Signs sampler reads CPU, temperature, and memory for the Monitor. Higher values reduce host CPU usage; lower values refresh metrics faster.",
+    fields: [
+      { path: ["sampling_intervals", "cpu"], label: "CPU interval" },
+      { path: ["sampling_intervals", "temperature"], label: "Temperature interval" },
+      { path: ["sampling_intervals", "memory"], label: "Memory interval" },
+    ],
+  },
 ]
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -369,6 +388,7 @@ export function HealthThresholds() {
   const { capabilities } = useAccess()
   const t = useT()
   const isPbs = useIsPbs()
+  const fieldIdPrefix = useId()
   const tFallback = (key: string, fallback: string) => {
     const translated = t(key)
     return translated === key ? fallback : translated
@@ -535,14 +555,21 @@ export function HealthThresholds() {
     const customisedClass = "border-blue-500 bg-blue-500/10 focus-visible:border-blue-500"
     const fieldClass = isCustomised ? customisedClass : severityClass
     const recommendedTooltip = `${t("settings.healthThresholds.recommended")}: ${leaf.recommended}${leaf.unit}`
+    const inputId = `${fieldIdPrefix}-${key.replace(/\//g, "-")}`
     return (
       <div key={key} className="flex items-center justify-between gap-2 py-1.5 px-1">
-        <span className="text-xs sm:text-sm text-foreground/90 min-w-0">
+        <label
+          htmlFor={inputId}
+          className="text-xs sm:text-sm text-foreground/90 min-w-0"
+        >
           {label}
-        </span>
+        </label>
         <div className="flex items-center gap-2 flex-shrink-0">
           <Input
+            id={inputId}
+            name={key}
             type="number"
+            inputMode="numeric"
             min={leaf.min}
             max={leaf.max}
             step={leaf.step}
@@ -932,7 +959,14 @@ export function HealthThresholds() {
                       // Fallback for any future section shape — keep
                       // the original per-field number inputs.
                       <div className="divide-y divide-border/40">
-                        {section.fields.map((f) => renderField(f.path, f.label))}
+                        {section.fields.map((f) => {
+                          const leafKey = f.path[f.path.length - 1]
+                          const fieldLabel = tFallback(
+                            `settings.healthThresholds.sections.${section.id}.${leafKey}`,
+                            f.label,
+                          )
+                          return renderField(f.path, fieldLabel)
+                        })}
                       </div>
                     )}
                   </div>

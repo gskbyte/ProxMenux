@@ -1676,45 +1676,66 @@ def _vital_signs_sampler():
     kept in vital_signs and in the health monitor's history, are the only
     source of these values: the dashboard, the health checks and the
     exporters read them instead of reading the host again. The intervals
-    are in vital_signs. Uses time.monotonic() to avoid drift.
+    live in vital_signs and can be updated at runtime through
+    health_thresholds. Uses time.monotonic() to avoid drift.
 
     Staggered intervals to avoid collision: CPU at 0, Temp at +7s, Mem at +15s.
     """
     from health_monitor import health_monitor
 
+    vital_signs.refresh_intervals()
+
     # Wait 15s after startup for sensors to be ready
     time.sleep(15)
 
-    TEMP_INTERVAL = vital_signs.TEMPERATURE_INTERVAL
-    CPU_INTERVAL = vital_signs.CPU_INTERVAL
-    MEM_INTERVAL = vital_signs.MEMORY_INTERVAL
+    cpu_interval, temp_interval, mem_interval = vital_signs.refresh_intervals()
 
-    # Stagger: CPU starts immediately, Temp after 7s, Mem after 15s
-    next_cpu  = time.monotonic()
-    next_temp = time.monotonic() + 7
-    next_mem  = time.monotonic() + 15
+    # Stagger: CPU starts immediately, Temp after up to 7s, Mem after up to 15s
+    start = time.monotonic()
+    next_cpu = start
+    next_temp = start + min(7, temp_interval)
+    next_mem = start + min(15, mem_interval)
+    last_cpu = None
+    last_temp = None
+    last_mem = None
+    prev_intervals = (cpu_interval, temp_interval, mem_interval)
 
-    print(f"[ProxMenux] Vital signs sampler started (CPU: {CPU_INTERVAL}s, Mem: {MEM_INTERVAL}s, Temp: {TEMP_INTERVAL}s)")
+    print(f"[ProxMenux] Vital signs sampler started (CPU: {cpu_interval}s, Mem: {mem_interval}s, Temp: {temp_interval}s)")
 
     while True:
         try:
+            vital_signs.clear_interval_change()
+            cpu_interval, temp_interval, mem_interval = vital_signs.refresh_intervals()
             now = time.monotonic()
+
+            if (cpu_interval, temp_interval, mem_interval) != prev_intervals:
+                next_cpu = last_cpu + cpu_interval if last_cpu is not None else min(next_cpu, now + cpu_interval)
+                next_temp = last_temp + temp_interval if last_temp is not None else min(next_temp, now + temp_interval)
+                next_mem = last_mem + mem_interval if last_mem is not None else min(next_mem, now + mem_interval)
+                prev_intervals = (cpu_interval, temp_interval, mem_interval)
+                print(
+                    f"[ProxMenux] Vital signs sampling intervals updated "
+                    f"(CPU: {cpu_interval}s, Mem: {mem_interval}s, Temp: {temp_interval}s)"
+                )
 
             if now >= next_temp:
                 health_monitor._sample_cpu_temperature()
-                next_temp = now + TEMP_INTERVAL
+                last_temp = now
+                next_temp = now + temp_interval
 
             if now >= next_cpu:
                 health_monitor._sample_cpu_usage()
-                next_cpu = now + CPU_INTERVAL
+                last_cpu = now
+                next_cpu = now + cpu_interval
 
             if now >= next_mem:
                 health_monitor._sample_memory_usage()
-                next_mem = now + MEM_INTERVAL
+                last_mem = now
+                next_mem = now + mem_interval
 
             # Sleep until the next earliest event (with 0.5s min to avoid busy-loop)
             sleep_until = min(next_temp, next_cpu, next_mem) - time.monotonic()
-            time.sleep(max(sleep_until, 0.5))
+            vital_signs.wait_for_interval_change(max(sleep_until, 0.5))
         except Exception as e:
             print(f"[ProxMenux] Vital signs sampler error: {e}")
             time.sleep(10)
@@ -15347,6 +15368,7 @@ def api_health_thresholds_put():
             effective = ht.save(payload)
         except ht.ThresholdValidationError as e:
             return jsonify({'success': False, 'message': str(e)}), 400
+        vital_signs.refresh_intervals(ht)
         return jsonify({'success': True, 'thresholds': effective})
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
@@ -15367,6 +15389,7 @@ def api_health_thresholds_reset():
                 effective = ht.reset_all()
         except ht.ThresholdValidationError as e:
             return jsonify({'success': False, 'message': str(e)}), 400
+        vital_signs.refresh_intervals(ht)
         return jsonify({'success': True, 'thresholds': effective})
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500

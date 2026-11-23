@@ -13,21 +13,95 @@ import time
 
 import psutil
 
+# Default sampling cadence, in seconds. Matches health_thresholds.DEFAULTS.
+DEFAULT_CPU_INTERVAL = 5
+DEFAULT_TEMPERATURE_INTERVAL = 15
+DEFAULT_MEMORY_INTERVAL = 30
+
 # How often the sampler reads each value, in seconds.
-CPU_INTERVAL = 5
-TEMPERATURE_INTERVAL = 15
-MEMORY_INTERVAL = 30
+# Updated at runtime via refresh_intervals() when thresholds change.
+CPU_INTERVAL = DEFAULT_CPU_INTERVAL
+TEMPERATURE_INTERVAL = DEFAULT_TEMPERATURE_INTERVAL
+MEMORY_INTERVAL = DEFAULT_MEMORY_INTERVAL
 
 # What a page that polls every few seconds accepts as current.
 LIVE_MAX_AGE = 5
 
 _lock = threading.Lock()
+_intervals_lock = threading.Lock()
+_intervals_changed = threading.Event()
 _readings = {}
 _cpu_counters = None
 
 # Intel, AMD (two drivers), generic ARM, then the ACPI thermal zone, which
 # is usually the motherboard.
 _CPU_SENSORS = ('coretemp', 'k10temp', 'cpu_thermal', 'zenpower', 'acpitz')
+
+
+def _coerce_interval(value, meta, default):
+    """Return a valid interval within [min, max] from metadata, or default."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    if not math.isfinite(value):
+        return default
+    lo = meta.get('min', 1) if isinstance(meta, dict) else 1
+    hi = meta.get('max') if isinstance(meta, dict) else None
+    if value < lo or (hi is not None and value > hi):
+        return default
+    return int(value) if float(value).is_integer() else float(value)
+
+
+def refresh_intervals(thresholds=None):
+    """Reload sampling intervals from health_thresholds and wake the sampler on change."""
+    global CPU_INTERVAL, TEMPERATURE_INTERVAL, MEMORY_INTERVAL
+    with _intervals_lock:
+        if thresholds is None:
+            try:
+                import health_thresholds as thresholds
+            except Exception:
+                return (CPU_INTERVAL, TEMPERATURE_INTERVAL, MEMORY_INTERVAL)
+
+        try:
+            defaults = getattr(thresholds, 'DEFAULTS', {}).get('sampling_intervals', {})
+            new_cpu = _coerce_interval(
+                thresholds.get('sampling_intervals', 'cpu', default=DEFAULT_CPU_INTERVAL),
+                defaults.get('cpu'),
+                DEFAULT_CPU_INTERVAL,
+            )
+            new_temp = _coerce_interval(
+                thresholds.get('sampling_intervals', 'temperature', default=DEFAULT_TEMPERATURE_INTERVAL),
+                defaults.get('temperature'),
+                DEFAULT_TEMPERATURE_INTERVAL,
+            )
+            new_mem = _coerce_interval(
+                thresholds.get('sampling_intervals', 'memory', default=DEFAULT_MEMORY_INTERVAL),
+                defaults.get('memory'),
+                DEFAULT_MEMORY_INTERVAL,
+            )
+        except Exception:
+            return (CPU_INTERVAL, TEMPERATURE_INTERVAL, MEMORY_INTERVAL)
+
+        changed = (new_cpu, new_temp, new_mem) != (
+            CPU_INTERVAL,
+            TEMPERATURE_INTERVAL,
+            MEMORY_INTERVAL,
+        )
+        CPU_INTERVAL = new_cpu
+        TEMPERATURE_INTERVAL = new_temp
+        MEMORY_INTERVAL = new_mem
+        if changed:
+            _intervals_changed.set()
+        return (new_cpu, new_temp, new_mem)
+
+
+def clear_interval_change():
+    """Clear any pending interval-change signal before reading intervals."""
+    _intervals_changed.clear()
+
+
+def wait_for_interval_change(timeout):
+    """Sleep up to `timeout` seconds, waking early if intervals change."""
+    return _intervals_changed.wait(timeout=timeout)
 
 
 def samples_for(seconds, interval):

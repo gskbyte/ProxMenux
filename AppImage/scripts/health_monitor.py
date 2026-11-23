@@ -441,6 +441,7 @@ class HealthMonitor:
                 v = _ht.get(*path)
                 if v is not None:
                     setattr(self, attr, v)
+            vital_signs.refresh_intervals(_ht)
         except Exception as e:
             print(f"[HealthMonitor] threshold refresh failed: {e}")
 
@@ -601,10 +602,11 @@ class HealthMonitor:
                 'system': usage['system'],
                 'time': current_time
             })
-            # Prune entries older than 6 minutes
+            # Prune entries older than 6 minutes (or 2x interval when longer)
+            cpu_retention = max(360, vital_signs.CPU_INTERVAL * 2)
             self.state_history[state_key] = [
                 e for e in self.state_history[state_key]
-                if current_time - e['time'] < 360
+                if current_time - e['time'] < cpu_retention
             ]
         except Exception:
             pass  # Sampling must never crash the thread
@@ -624,10 +626,11 @@ class HealthMonitor:
                 'available_percent': available_percent,
                 'time': current_time
             })
-            # Prune entries older than 10 minutes
+            # Prune entries older than 10 minutes (or 2x interval when longer)
+            mem_retention = max(600, vital_signs.MEMORY_INTERVAL * 2)
             self.state_history[state_key] = [
                 e for e in self.state_history[state_key]
-                if current_time - e['time'] < 600
+                if current_time - e['time'] < mem_retention
             ]
         except Exception:
             pass  # Sampling must never crash the thread
@@ -644,10 +647,11 @@ class HealthMonitor:
                 'value': max_temp,
                 'time': current_time
             })
-            # Prune entries older than 4 minutes
+            # Prune entries older than 4 minutes (or 2x interval when longer)
+            temp_retention = max(240, vital_signs.TEMPERATURE_INTERVAL * 2)
             self.state_history[state_key] = [
                 e for e in self.state_history[state_key]
-                if current_time - e['time'] < 240
+                if current_time - e['time'] < temp_retention
             ]
         except Exception:
             pass  # Sampling must never crash the thread
@@ -1315,30 +1319,36 @@ class HealthMonitor:
             # Snapshot the list for thread-safe reading (sampler may append concurrently)
             cpu_snapshot = list(self.state_history[state_key])
             
-            # Count samples in the monitoring windows
+            # Count samples in the monitoring windows (always at least one
+            # sampling interval + jitter margin so long intervals don't flap)
+            cpu_interval = vital_signs.CPU_INTERVAL
+            critical_window = max(self.CPU_CRITICAL_DURATION, cpu_interval + 15)
+            warning_window = max(self.CPU_WARNING_DURATION, cpu_interval + 15)
+            recovery_window = max(self.CPU_RECOVERY_DURATION, cpu_interval + 15)
+
             critical_samples = [
                 entry for entry in cpu_snapshot
                 if entry['value'] >= self.CPU_CRITICAL and
-                current_time - entry['time'] <= self.CPU_CRITICAL_DURATION
+                current_time - entry['time'] <= critical_window
             ]
             
             warning_samples = [
                 entry for entry in cpu_snapshot
                 if entry['value'] >= self.CPU_WARNING and
-                current_time - entry['time'] <= self.CPU_WARNING_DURATION
+                current_time - entry['time'] <= warning_window
             ]
             
             recovery_samples = [
                 entry for entry in cpu_snapshot
                 if entry['value'] < self.CPU_RECOVERY and
-                current_time - entry['time'] <= self.CPU_RECOVERY_DURATION
+                current_time - entry['time'] <= recovery_window
             ]
             
             # Readings above the limit must add up to 125s within the window,
             # and 50s below the recovery limit clear a warning.
-            CRITICAL_MIN_SAMPLES = vital_signs.samples_for(125, vital_signs.CPU_INTERVAL)
-            WARNING_MIN_SAMPLES = vital_signs.samples_for(125, vital_signs.CPU_INTERVAL)
-            RECOVERY_MIN_SAMPLES = vital_signs.samples_for(50, vital_signs.CPU_INTERVAL)
+            CRITICAL_MIN_SAMPLES = vital_signs.samples_for(125, cpu_interval)
+            WARNING_MIN_SAMPLES = vital_signs.samples_for(125, cpu_interval)
+            RECOVERY_MIN_SAMPLES = vital_signs.samples_for(50, cpu_interval)
             
             # Build the `details` payload the cpu_high notification
             # template (notification_templates.py) expects: `value`
@@ -1459,8 +1469,11 @@ class HealthMonitor:
         
         try:
             # The readings of the vital-signs sampler, the highest sensor each time.
+            interval = vital_signs.TEMPERATURE_INTERVAL
+            temp_window = max(180, interval + 15)
+            recovery_window = max(30, interval + 15)
             temp_snapshot = list(self.state_history['cpu_temp_history'])
-            recent = [entry for entry in temp_snapshot if current_time - entry['time'] <= 180]
+            recent = [entry for entry in temp_snapshot if current_time - entry['time'] <= temp_window]
             
             if recent:
                 max_temp = recent[-1]['value']
@@ -1471,12 +1484,11 @@ class HealthMonitor:
                 # Check if temperature ≤80°C for last 30 seconds (recovery)
                 recovery_samples = [
                     entry for entry in recent
-                    if entry['value'] <= 80 and current_time - entry['time'] <= 30
+                    if entry['value'] <= 80 and current_time - entry['time'] <= recovery_window
                 ]
                 
                 # The readings above 80°C must cover the 3 minutes, give or take
                 # the reading on its edge.
-                interval = vital_signs.TEMPERATURE_INTERVAL
                 if len(high_temp_samples) >= vital_signs.samples_for(180 - interval, interval):
                     # Temperature has been >80°C for >3 minutes - calculate actual duration
                     oldest = min(s['time'] for s in high_temp_samples)
@@ -1561,17 +1573,20 @@ class HealthMonitor:
 
             state_key = 'memory_usage'
             history = list(self.state_history[state_key])
+            mem_interval = vital_signs.MEMORY_INTERVAL
+            mem_window = max(self.MEMORY_DURATION, mem_interval + 15)
+            swap_window = max(self.SWAP_CRITICAL_DURATION, mem_interval + 15)
 
             mem_critical_samples = [
                 entry for entry in history
                 if entry['mem_percent'] >= self.MEMORY_CRITICAL and
-                current_time - entry['time'] <= self.MEMORY_DURATION
+                current_time - entry['time'] <= mem_window
             ]
 
             mem_warning_samples = [
                 entry for entry in history
                 if entry['mem_percent'] >= self.MEMORY_WARNING and
-                current_time - entry['time'] <= self.MEMORY_DURATION
+                current_time - entry['time'] <= mem_window
             ]
 
             # Swap CRITICAL requires BOTH conditions sustained. Older
@@ -1582,14 +1597,14 @@ class HealthMonitor:
                 1 for entry in history
                 if entry['swap_percent'] > self.SWAP_HIGH_PERCENT
                 and entry.get('available_percent', 100) < self.AVAILABLE_MIN_PERCENT
-                and current_time - entry['time'] <= self.SWAP_CRITICAL_DURATION
+                and current_time - entry['time'] <= swap_window
             )
 
             # Readings above the limit must add up to 240s of the 300s window;
             # swap pressure to 60s.
-            MEM_CRITICAL_MIN_SAMPLES = vital_signs.samples_for(240, vital_signs.MEMORY_INTERVAL)
-            MEM_WARNING_MIN_SAMPLES = vital_signs.samples_for(240, vital_signs.MEMORY_INTERVAL)
-            SWAP_CRITICAL_MIN_SAMPLES = vital_signs.samples_for(60, vital_signs.MEMORY_INTERVAL)
+            MEM_CRITICAL_MIN_SAMPLES = vital_signs.samples_for(240, mem_interval)
+            MEM_WARNING_MIN_SAMPLES = vital_signs.samples_for(240, mem_interval)
+            SWAP_CRITICAL_MIN_SAMPLES = vital_signs.samples_for(60, mem_interval)
 
             mem_critical_count = len(mem_critical_samples)
             mem_warning_count = len(mem_warning_samples)
