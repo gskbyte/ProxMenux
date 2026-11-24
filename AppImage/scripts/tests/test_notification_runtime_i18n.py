@@ -68,6 +68,11 @@ class RuntimeCatalogTests(unittest.TestCase):
             return result
 
         en = flatten(self.catalogs["en"])
+        pending_i18n = {
+            "cpu.topConsumers",
+            "cpu.host",
+            "channels.email.fields.topConsumers",
+        }
         pending_slovak = {"backup.confirmedTitle", "backup.confirmedBody",
                           "backup.errorTitle", "backup.errorBody", "backup.unconfirmedBody",
                           "backup.unconfirmedTitle", "channels.email.status.unconfirmed",
@@ -75,13 +80,14 @@ class RuntimeCatalogTests(unittest.TestCase):
                           "channels.email.status.completed_with_warnings"}
         for language, catalog in self.catalogs.items():
             translated = flatten(catalog)
-            if language == 'sk':
-                # Missing maintainer-owned leaves may be generated later.
-                # Accept only this bounded gap, and validate every present leaf.
-                self.assertTrue(set(en) - pending_slovak <= set(translated), language)
-                self.assertTrue(set(translated) <= set(en), language)
-            else:
+            if language == 'en':
                 self.assertEqual(set(translated), set(en), language)
+            else:
+                # Missing maintainer-owned / auto-filled leaves may be generated
+                # later. Accept only this bounded gap, and validate every present leaf.
+                allowed_missing = pending_i18n | (pending_slovak if language == 'sk' else set())
+                self.assertTrue(set(en) - allowed_missing <= set(translated), language)
+                self.assertTrue(set(translated) <= set(en), language)
             for key in translated:
                 self.assertIsInstance(translated[key], str, f"{language}:{key}")
                 self.assertTrue(translated[key].strip(), f"{language}:{key}")

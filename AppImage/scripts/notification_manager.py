@@ -1465,7 +1465,7 @@ class NotificationManager:
         narrowed.pop('title', None)
         rendered = render_template('health_degraded', narrowed,
                                    language=data.get('_notification_language') or self._notification_language())
-        return rendered['title'], rendered['body'], severity
+        return rendered['title'], rendered['body'], severity, narrowed
 
     def _dispatch_to_channels(self, title: str, body: str, severity: str,
                                event_type: str, data: Dict, source: str) -> bool:
@@ -1504,6 +1504,7 @@ class NotificationManager:
         base_title, base_body, base_severity = title, body, severity
         for ch_name, channel in channels.items():
             title, body, severity = base_title, base_body, base_severity
+            ch_data = data
             if not self._channel_allows(ch_name, event_type, data):
                 continue
             if event_type == 'health_degraded':
@@ -1511,7 +1512,7 @@ class NotificationManager:
                 if narrowed is False:
                     continue
                 if narrowed:
-                    title, body, severity = narrowed
+                    title, body, severity, ch_data = narrowed
             channel_buffer_title = buffer_title if title == base_title else title
 
             # ── Per-channel quiet hours ──
@@ -1586,7 +1587,7 @@ class NotificationManager:
                     if _should_bypass_ai(event_type):
                         ai_result = _format_backup_with_ai_bounded(
                             ch_title, ch_body, severity, channel_ai_config,
-                            event_type=event_type, data=data,
+                            event_type=event_type, data=ch_data,
                             detail_level=detail_level, use_emojis=use_rich_format,
                         )
                     else:
@@ -1594,7 +1595,7 @@ class NotificationManager:
                             title=ch_title,
                             body=ch_body,
                             event_type=event_type,
-                            data=data,
+                            data=ch_data,
                             journal_context=raw_journal_context,
                             detail_level=detail_level
                         )
@@ -1625,13 +1626,13 @@ class NotificationManager:
                 
                 if use_rich_format and not ai_enabled:
                     ch_title, ch_body = enrich_with_emojis(
-                        event_type, ch_title, ch_body, data
+                        event_type, ch_title, ch_body, ch_data
                     )
                 
-                ch_data = dict(data) if data else {}
-                ch_data['_use_rich_format'] = use_rich_format
-                ch_data['_use_rich_cards'] = use_rich_cards
-                result = channel.send(ch_title, ch_body, severity, ch_data)
+                send_data = dict(ch_data) if ch_data else {}
+                send_data['_use_rich_format'] = use_rich_format
+                send_data['_use_rich_cards'] = use_rich_cards
+                result = channel.send(ch_title, ch_body, severity, send_data)
                 self._record_history(
                     event_type, ch_name, ch_title, ch_body, severity,
                     result.get('success', False),

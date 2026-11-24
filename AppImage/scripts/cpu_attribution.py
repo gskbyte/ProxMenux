@@ -309,11 +309,10 @@ class CpuAttributionSampler:
         Returns None on the first call (baseline only) or if elapsed time is
         too small to compute a reliable delta.
         """
-        ts = time.monotonic() if now is None else float(now)
-        proc_snap = self._snapshot_proc()
-        cg_snap = self._snapshot_cgroups()
-
         with self._lock:
+            ts = time.monotonic() if now is None else float(now)
+            proc_snap = self._snapshot_proc()
+            cg_snap = self._snapshot_cgroups()
             prev = self._prev
             self._prev = (ts, proc_snap, cg_snap)
 
@@ -493,6 +492,14 @@ def summarize_consumers(
     lxc_proc_counts: Dict[Tuple[str, Any], Dict[str, int]] = defaultdict(lambda: defaultdict(int))
     host_counts: Dict[Tuple[str, Any], int] = defaultdict(int)
 
+    def _safe_count(value: Any) -> int:
+        if isinstance(value, bool) or value is None:
+            return 1
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return 1
+
     for sample in valid_samples:
         for item in sample:
             if not isinstance(item, dict):
@@ -532,7 +539,7 @@ def summarize_consumers(
                             continue
                         if ppct > 0:
                             lxc_proc_totals[key][pname] += ppct
-                            pcount = int(proc.get('count', 1) or 1)
+                            pcount = _safe_count(proc.get('count', 1))
                             if pcount > lxc_proc_counts[key][pname]:
                                 lxc_proc_counts[key][pname] = pcount
             else:
@@ -542,7 +549,7 @@ def summarize_consumers(
                 key = ('host', name)
                 totals[key] += pct
                 meta[key] = {'kind': 'host', 'name': name}
-                count = int(item.get('count', 1) or 1)
+                count = _safe_count(item.get('count', 1))
                 if count > host_counts[key]:
                     host_counts[key] = count
 

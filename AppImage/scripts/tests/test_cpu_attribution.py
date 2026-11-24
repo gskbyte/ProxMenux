@@ -412,6 +412,38 @@ class HealthMonitorCpuAttributionTests(unittest.TestCase):
         self.monitor._cpu_attribution.take_fallback_sample.assert_not_called()
         self.assertNotIn('top_consumers', result2)
 
+    def test_critical_temperature_override_clears_top_consumers_from_health_result(self):
+        now = self.hm.time.time()
+        self.monitor.state_history['cpu_usage'] = [
+            {
+                'value': 91.0,
+                'time': now - age,
+                'consumers': [{'kind': 'vm', 'vmid': 100, 'name': 'app', 'cpu_pct': 70.0}],
+            }
+            for age in range(150, -1, -5)
+        ]
+        temp_crit = {'status': 'CRITICAL', 'reason': 'Sensor temperature 95°C >90°C'}
+        with mock.patch.object(self.hm.vital_signs, 'CPU_INTERVAL', 5), \
+                mock.patch.object(self.hm.vital_signs, 'cpu', return_value={'value': 91.0}), \
+                mock.patch.object(self.hm, 'psutil', SimpleNamespace(cpu_count=lambda *a, **k: 8), create=True), \
+                mock.patch.object(self.monitor, '_check_cpu_temperature', return_value=temp_crit):
+            result = self.monitor._check_cpu_with_hysteresis()
+
+        self.assertEqual(result['status'], 'CRITICAL')
+        self.assertEqual(result['reason'], temp_crit['reason'])
+        self.assertNotIn('top_consumers', result)
+        # Direct cpu_usage error still retains top_consumers for cpu_high alerts
+        self.assertEqual(
+            self.recorded[0]['details']['top_consumers'],
+            [{'kind': 'vm', 'vmid': 100, 'name': 'app', 'cpu_pct': 70.0}],
+        )
+
+    def test_summarize_consumers_tolerates_malformed_count(self):
+        summary = cpu_attribution.summarize_consumers([
+            [{'kind': 'host', 'name': 'zstd', 'cpu_pct': 20.0, 'count': 'bad'}],
+        ])
+        self.assertEqual(summary, [{'kind': 'host', 'name': 'zstd', 'cpu_pct': 20.0}])
+
 
 if __name__ == '__main__':
     unittest.main()

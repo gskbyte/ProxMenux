@@ -1487,6 +1487,9 @@ class HealthMonitor:
                 if temp_status.get('status') == 'CRITICAL':
                     result['status'] = 'CRITICAL'
                     result['reason'] = temp_status.get('reason')
+                    # Avoid pairing a temperature-only reason with CPU-usage
+                    # consumers in health_degraded; cpu_high still carries them.
+                    result.pop('top_consumers', None)
                 elif temp_status.get('status') == 'WARNING' and status == 'OK':
                     result['status'] = 'WARNING'
                     result['reason'] = temp_status.get('reason')
