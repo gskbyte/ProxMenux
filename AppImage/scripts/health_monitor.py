@@ -52,6 +52,10 @@ DEBUG_PERF = False
 # Import centralized startup grace management for consistent behavior
 import startup_grace
 import vital_signs
+try:
+    import cpu_attribution
+except ImportError:
+    cpu_attribution = None
 from pbs_manager import get_platform, PBS_SERVICES
 
 def _is_startup_health_grace() -> bool:
@@ -449,6 +453,9 @@ class HealthMonitor:
         """Initialize health monitor with state tracking"""
         self.platform_type = get_platform().get("product")
         self.state_history = defaultdict(list)
+        self._cpu_attribution = (
+            cpu_attribution.CpuAttributionSampler() if cpu_attribution is not None else None
+        )
         self.last_check_times = {}
         self.cached_results = {}
         self.network_baseline = {}
@@ -596,12 +603,36 @@ class HealthMonitor:
                 return
             current_time = time.time()
             state_key = 'cpu_usage'
-            self.state_history[state_key].append({
+            entry = {
                 'value': usage['value'],
                 'user': usage['user'],
                 'system': usage['system'],
                 'time': current_time
-            })
+            }
+
+            # Zero-overhead conditional attribution: only scan /proc & cgroups
+            # while host CPU is at or above the warning threshold.
+            sampler = getattr(self, '_cpu_attribution', None)
+            if sampler is not None:
+                try:
+                    warning_threshold = self.CPU_WARNING
+                    try:
+                        import health_thresholds as _ht
+                        override = _ht.get('cpu', 'warning')
+                        if override is not None:
+                            warning_threshold = override
+                    except Exception:
+                        pass
+                    if usage['value'] >= warning_threshold:
+                        consumers = sampler.sample()
+                        if consumers is not None:
+                            entry['consumers'] = consumers
+                    else:
+                        sampler.reset()
+                except Exception:
+                    pass  # Attribution must never disrupt vital-signs sampling
+
+            self.state_history[state_key].append(entry)
             # Prune entries older than 6 minutes (or 2x interval when longer)
             cpu_retention = max(360, vital_signs.CPU_INTERVAL * 2)
             self.state_history[state_key] = [
@@ -1359,6 +1390,29 @@ class HealthMonitor:
             # and "CPU usage has reached % on  cores." with no values.
             cpu_count = os.cpu_count() or 1
             value_str = f"{cpu_percent:.0f}"
+            top_consumers: List[Dict[str, Any]] = []
+
+            def _resolve_top_consumers(trigger_samples, active_threshold):
+                if cpu_attribution is None:
+                    return []
+                consumer_samples = [
+                    e['consumers'] for e in trigger_samples
+                    if isinstance(e.get('consumers'), list)
+                ]
+                if consumer_samples:
+                    return cpu_attribution.summarize_consumers(consumer_samples)
+                # Edge case: very long CPU_INTERVAL (>=125s) can trigger on a
+                # single high sample before a second tick exists. Only take a
+                # short fallback sample if CPU is still elevated right now.
+                sampler = getattr(self, '_cpu_attribution', None)
+                if sampler is not None and cpu_percent >= active_threshold:
+                    try:
+                        fallback = sampler.take_fallback_sample(interval=0.5)
+                        if fallback:
+                            return cpu_attribution.summarize_consumers([fallback])
+                    except Exception:
+                        pass
+                return []
 
             if len(critical_samples) >= CRITICAL_MIN_SAMPLES:
                 # Calculate actual duration from oldest to newest sample
@@ -1366,38 +1420,48 @@ class HealthMonitor:
                 actual_duration = int(current_time - oldest)
                 status = 'CRITICAL'
                 reason = f'CPU >{self.CPU_CRITICAL}% sustained for {actual_duration}s'
+                top_consumers = _resolve_top_consumers(critical_samples, self.CPU_CRITICAL)
+                error_details = {
+                    'value': value_str,
+                    'cores': cpu_count,
+                    'threshold': self.CPU_CRITICAL,
+                    'details': f'Sustained for {actual_duration}s above {self.CPU_CRITICAL}%.',
+                    'cpu_percent': cpu_percent,
+                    'duration': actual_duration,
+                }
+                if top_consumers:
+                    error_details['top_consumers'] = top_consumers
                 # Record the error
                 health_persistence.record_error(
                     error_key='cpu_usage',
                     category='cpu',
                     severity='CRITICAL',
                     reason=reason,
-                    details={
-                        'value': value_str,
-                        'cores': cpu_count,
-                        'details': f'Sustained for {actual_duration}s above {self.CPU_CRITICAL}%.',
-                        'cpu_percent': cpu_percent,
-                        'duration': actual_duration,
-                    },
+                    details=error_details,
                 )
             elif len(warning_samples) >= WARNING_MIN_SAMPLES and len(recovery_samples) < RECOVERY_MIN_SAMPLES:
                 oldest = min(s['time'] for s in warning_samples)
                 actual_duration = int(current_time - oldest)
                 status = 'WARNING'
                 reason = f'CPU >{self.CPU_WARNING}% sustained for {actual_duration}s'
+                top_consumers = _resolve_top_consumers(warning_samples, self.CPU_WARNING)
+                error_details = {
+                    'value': value_str,
+                    'cores': cpu_count,
+                    'threshold': self.CPU_WARNING,
+                    'details': f'Sustained for {actual_duration}s above {self.CPU_WARNING}%.',
+                    'cpu_percent': cpu_percent,
+                    'duration': actual_duration,
+                }
+                if top_consumers:
+                    error_details['top_consumers'] = top_consumers
                 # Record the warning
                 health_persistence.record_error(
                     error_key='cpu_usage',
                     category='cpu',
                     severity='WARNING',
                     reason=reason,
-                    details={
-                        'value': value_str,
-                        'cores': cpu_count,
-                        'details': f'Sustained for {actual_duration}s above {self.CPU_WARNING}%.',
-                        'cpu_percent': cpu_percent,
-                        'duration': actual_duration,
-                    },
+                    details=error_details,
                 )
             else:
                 status = 'OK'
@@ -1415,6 +1479,8 @@ class HealthMonitor:
             
             if reason:
                 result['reason'] = reason
+            if top_consumers:
+                result['top_consumers'] = top_consumers
             
             if temp_status and temp_status.get('status') != 'UNKNOWN':
                 result['temperature'] = temp_status

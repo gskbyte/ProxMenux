@@ -4,13 +4,19 @@ import json
 import sys
 import tempfile
 import unittest
+from collections import defaultdict
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
-SCRIPTS_DIR = Path(__file__).resolve().parents[1]
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
+TESTS_DIR = Path(__file__).resolve().parent
+SCRIPTS_DIR = TESTS_DIR.parent
+for _p in (str(TESTS_DIR), str(SCRIPTS_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import cpu_attribution  # noqa: E402
+from health_fixture_modules import load_health_modules  # noqa: E402
 
 
 def _stat_line(pid: int, comm: str, utime: int, stime: int, starttime: int) -> str:
@@ -293,6 +299,118 @@ class CpuAttributionTests(unittest.TestCase):
             {'kind': 'lxc', 'vmid': 108, 'name': 'plex', 'cpu_pct': 20.0,
              'processes': [{'name': 'ffmpeg', 'cpu_pct': 18.0}]},
         ])
+
+
+class HealthMonitorCpuAttributionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        temporary = tempfile.TemporaryDirectory(prefix='cpu-attr-hm-')
+        cls.addClassCleanup(temporary.cleanup)
+        cls.hm, _, _ = load_health_modules(temporary.name)
+
+    def setUp(self):
+        self.monitor = self.hm.HealthMonitor.__new__(self.hm.HealthMonitor)
+        self.monitor.state_history = defaultdict(list)
+        self.monitor.cached_results = {}
+        self.monitor.last_check_times = {}
+        self.monitor._cpu_attribution = mock.MagicMock()
+        self.recorded = []
+        patcher = mock.patch.object(
+            self.hm.health_persistence, 'record_error',
+            side_effect=lambda **kw: self.recorded.append(kw),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        res_patcher = mock.patch.object(self.hm.health_persistence, 'resolve_error')
+        res_patcher.start()
+        self.addCleanup(res_patcher.stop)
+
+    def test_sample_cpu_usage_gates_attribution_on_warning_threshold(self):
+        self.monitor._cpu_attribution.sample.return_value = [
+            {'kind': 'vm', 'vmid': 100, 'name': 'app', 'cpu_pct': 70.0}
+        ]
+        # Healthy sample -> reset, never sample
+        with mock.patch.object(
+            self.hm.vital_signs, 'sample_cpu',
+            return_value={'value': 25.0, 'user': 20.0, 'system': 5.0},
+        ):
+            self.monitor._sample_cpu_usage()
+        self.monitor._cpu_attribution.reset.assert_called_once()
+        self.monitor._cpu_attribution.sample.assert_not_called()
+        self.assertNotIn('consumers', self.monitor.state_history['cpu_usage'][-1])
+
+        # High CPU sample -> sample and attach consumers
+        with mock.patch.object(
+            self.hm.vital_signs, 'sample_cpu',
+            return_value={'value': 91.0, 'user': 85.0, 'system': 6.0},
+        ):
+            self.monitor._sample_cpu_usage()
+        self.monitor._cpu_attribution.sample.assert_called_once()
+        self.assertEqual(
+            self.monitor.state_history['cpu_usage'][-1]['consumers'],
+            [{'kind': 'vm', 'vmid': 100, 'name': 'app', 'cpu_pct': 70.0}],
+        )
+
+    def test_check_cpu_records_top_consumers_and_preserves_reason_format(self):
+        now = self.hm.time.time()
+        self.monitor.state_history['cpu_usage'] = [
+            {
+                'value': 92.0,
+                'time': now - age,
+                'consumers': [
+                    {'kind': 'lxc', 'vmid': 108, 'name': 'plex', 'cpu_pct': 65.0,
+                     'processes': [{'name': 'ffmpeg', 'cpu_pct': 60.0}]},
+                ],
+            }
+            for age in range(150, -1, -5)
+        ]
+        with mock.patch.object(self.hm.vital_signs, 'CPU_INTERVAL', 5), \
+                mock.patch.object(self.hm.vital_signs, 'cpu', return_value={'value': 92.0}), \
+                mock.patch.object(self.hm, 'psutil', SimpleNamespace(cpu_count=lambda *a, **k: 8), create=True), \
+                mock.patch.object(self.monitor, '_check_cpu_temperature', return_value=None):
+            result = self.monitor._check_cpu_with_hysteresis()
+
+        self.assertEqual(result['status'], 'WARNING')
+        self.assertRegex(result['reason'], r'^CPU >85% sustained for \d+s$')
+        self.assertEqual(result['top_consumers'], [
+            {'kind': 'lxc', 'vmid': 108, 'name': 'plex', 'cpu_pct': 65.0,
+             'processes': [{'name': 'ffmpeg', 'cpu_pct': 60.0}]},
+        ])
+        self.assertEqual(len(self.recorded), 1)
+        details = self.recorded[0]['details']
+        self.assertEqual(details['threshold'], 85)
+        self.assertEqual(details['top_consumers'], result['top_consumers'])
+        self.monitor._cpu_attribution.take_fallback_sample.assert_not_called()
+
+    def test_long_interval_fallback_runs_only_when_cpu_still_elevated(self):
+        now = self.hm.time.time()
+        self.monitor.state_history['cpu_usage'] = [{'value': 97.0, 'time': now}]
+        self.monitor._cpu_attribution.take_fallback_sample.return_value = [
+            {'kind': 'host', 'name': 'vzdump', 'cpu_pct': 82.0}
+        ]
+        with mock.patch.object(self.hm.vital_signs, 'CPU_INTERVAL', 150), \
+                mock.patch.object(self.hm.vital_signs, 'cpu', return_value={'value': 97.0}), \
+                mock.patch.object(self.hm, 'psutil', SimpleNamespace(cpu_count=lambda *a, **k: 4), create=True), \
+                mock.patch.object(self.monitor, '_check_cpu_temperature', return_value=None):
+            result = self.monitor._check_cpu_with_hysteresis()
+
+        self.assertEqual(result['status'], 'CRITICAL')
+        self.monitor._cpu_attribution.take_fallback_sample.assert_called_once()
+        self.assertEqual(
+            result['top_consumers'],
+            [{'kind': 'host', 'name': 'vzdump', 'cpu_pct': 82.0}],
+        )
+
+        # If CPU already dropped below threshold, do not take a fallback sample
+        self.monitor._cpu_attribution.take_fallback_sample.reset_mock()
+        with mock.patch.object(self.hm.vital_signs, 'CPU_INTERVAL', 150), \
+                mock.patch.object(self.hm.vital_signs, 'cpu', return_value={'value': 12.0}), \
+                mock.patch.object(self.hm, 'psutil', SimpleNamespace(cpu_count=lambda *a, **k: 4), create=True), \
+                mock.patch.object(self.monitor, '_check_cpu_temperature', return_value=None):
+            result2 = self.monitor._check_cpu_with_hysteresis()
+
+        self.monitor._cpu_attribution.take_fallback_sample.assert_not_called()
+        self.assertNotIn('top_consumers', result2)
 
 
 if __name__ == '__main__':
