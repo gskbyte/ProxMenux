@@ -1566,7 +1566,7 @@ def _health_collector_loop():
                         skip_notification = True
                     
                     if not skip_notification:
-                        degraded.append({
+                        degraded_item = {
                             'cat_key': cat_key,  # Original key for journal capture
                             'category': cat_name,
                             'status': cur_status,
@@ -1577,7 +1577,10 @@ def _health_collector_loop():
                             # `_check_XXX` in health_monitor when a single
                             # entity dominates; empty otherwise.
                             'entity': cat_data.get('entity', ''),
-                        })
+                        }
+                        if cat_data.get('top_consumers'):
+                            degraded_item['top_consumers'] = cat_data['top_consumers']
+                        degraded.append(degraded_item)
                 
                 _prev_statuses[cat_key] = cur_status
             

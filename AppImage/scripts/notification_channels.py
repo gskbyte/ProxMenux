@@ -1734,7 +1734,7 @@ class EmailChannel(NotificationChannel):
             'Total Updates': 'totalUpdates', 'Security Updates': 'securityUpdates',
             'Proxmox Updates': 'proxmoxUpdates', 'Kernel Updates': 'kernelUpdates',
             'Important Packages': 'importantPackages', 'Current Version': 'currentVersion',
-            'New Version': 'newVersion',
+            'New Version': 'newVersion', 'Top Consumers': 'topConsumers',
         }
         language_data = data
 
@@ -1763,6 +1763,18 @@ class EmailChannel(NotificationChannel):
                 rows.append((esc(label), f'<strong>{esc(v)}</strong>'))
             else:
                 rows.append((esc(label), esc(v)))
+
+        def _add_cpu_consumers(consumers):
+            if not consumers:
+                return
+            from notification_templates import _format_cpu_consumer_lines
+            lang = str((language_data or {}).get('_notification_language', 'en'))
+            consumer_lines = _format_cpu_consumer_lines(consumers, language=lang)
+            if not consumer_lines:
+                return
+            label = _runtime_text('email.fields.topConsumers', language_data) or 'Top Consumers'
+            consumers_html = '<br>'.join(esc(line) for line in consumer_lines)
+            rows.append((esc(label), consumers_html))
 
         # ── Common fields present in most events ──
         
@@ -1807,6 +1819,8 @@ class EmailChannel(NotificationChannel):
             _add('CPU Cores', data.get('cores'))
             _add('Memory', f"{data.get('used', '')} / {data.get('total', '')}" if data.get('used') else '')
             _add('Temperature', f"{data.get('value')}C" if 'temp' in event_type else '')
+            if event_type == 'cpu_high':
+                _add_cpu_consumers(data.get('top_consumers'))
 
         # ── Storage ──
         elif group == 'storage':
@@ -1870,6 +1884,14 @@ class EmailChannel(NotificationChannel):
             reason = data.get('reason', '')
             if reason and len(reason) <= 80:
                 _add('Details', reason)
+            hd_payload = data.get('health_degraded')
+            if isinstance(hd_payload, dict):
+                for cat_item in hd_payload.get('categories', []) or []:
+                    if (isinstance(cat_item, dict)
+                            and str(cat_item.get('key') or cat_item.get('cat_key') or '') == 'cpu'
+                            and cat_item.get('top_consumers')):
+                        _add_cpu_consumers(cat_item.get('top_consumers'))
+                        break
 
         # ── Updates ──
         elif group == 'updates':

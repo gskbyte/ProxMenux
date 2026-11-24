@@ -706,6 +706,91 @@ _CPU_SUSTAINED_REASON = re.compile(
 )
 
 
+def _format_cpu_consumer_lines(consumers, language: str = 'en') -> list:
+    """Format structured CPU consumer dicts into safe, localized display lines."""
+    if not isinstance(consumers, list) or not consumers:
+        return []
+    import math as _math
+
+    def _clean(value, max_len: int = 48) -> str:
+        text = re.sub(r'[\x00-\x1f\x7f]+', ' ', str(value or ''))
+        text = re.sub(r'\s+', ' ', text).strip()
+        if len(text) > max_len:
+            text = text[:max_len - 1].rstrip() + '…'
+        return text
+
+    def _finite_pct(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            return None
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return None
+        return num if _math.isfinite(num) and num > 0 else None
+
+    host_label = runtime_message('cpu.host', language) or 'Host'
+    lines = []
+    for item in consumers[:5]:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get('kind')
+        pct = _finite_pct(item.get('cpu_pct'))
+        if pct is None:
+            continue
+        pct_str = f'{max(1, round(pct))}%'
+
+        if kind == 'vm':
+            vmid = item.get('vmid')
+            if vmid is None or isinstance(vmid, bool):
+                continue
+            name = _clean(item.get('name'))
+            label = f'VM {vmid} ({name})' if name else f'VM {vmid}'
+            lines.append(f'{label}: {pct_str}')
+        elif kind == 'lxc':
+            vmid = item.get('vmid')
+            if vmid is None or isinstance(vmid, bool):
+                continue
+            name = _clean(item.get('name'))
+            label = f'CT {vmid} ({name})' if name else f'CT {vmid}'
+            proc_parts = []
+            raw_procs = item.get('processes')
+            if isinstance(raw_procs, list):
+                for proc in raw_procs[:2]:
+                    if not isinstance(proc, dict):
+                        continue
+                    pname = _clean(proc.get('name'), max_len=32)
+                    ppct = _finite_pct(proc.get('cpu_pct'))
+                    if not pname or ppct is None:
+                        continue
+                    pcount = proc.get('count')
+                    if isinstance(pcount, int) and not isinstance(pcount, bool) and pcount > 1:
+                        proc_parts.append(f'{pname} ×{pcount} {max(1, round(ppct))}%')
+                    else:
+                        proc_parts.append(f'{pname} {max(1, round(ppct))}%')
+            suffix = f' ({", ".join(proc_parts)})' if proc_parts else ''
+            lines.append(f'{label}: {pct_str}{suffix}')
+        elif kind == 'host':
+            name = _clean(item.get('name'), max_len=32)
+            if not name:
+                continue
+            count = item.get('count')
+            if isinstance(count, int) and not isinstance(count, bool) and count > 1:
+                proc_label = f'{name} ×{count}'
+            else:
+                proc_label = name
+            lines.append(f'{host_label} ({proc_label}): {pct_str}')
+    return lines
+
+
+def _format_cpu_consumers(consumers, language: str = 'en') -> str:
+    """Format structured CPU consumers as a multi-line bulleted text block."""
+    lines = _format_cpu_consumer_lines(consumers, language=language)
+    if not lines:
+        return ''
+    header = runtime_message('cpu.topConsumers', language) or 'Top consumers'
+    return f'{header}:\n' + '\n'.join(f'• {line}' for line in lines)
+
+
 def _format_health_degraded(data: Dict[str, Any],
                             language: str = 'en') -> Tuple[str, str]:
     """Render Monitor-generated health degradations in the chosen locale."""
@@ -736,10 +821,16 @@ def _format_health_degraded(data: Dict[str, Any],
         if str(item.get('key') or item.get('cat_key') or '') == 'cpu':
             match = _CPU_SUSTAINED_REASON.fullmatch(reason)
             if match:
-                return runtime_message(
+                reason = runtime_message(
                     'healthDegraded.reasons.cpuSustained', language,
                     threshold=match.group('threshold'), duration=match.group('duration'),
                 ) or reason
+            if item.get('top_consumers'):
+                consumers_block = _format_cpu_consumers(
+                    item.get('top_consumers'), language=language,
+                )
+                if consumers_block:
+                    reason = f'{reason}\n{consumers_block}' if reason else consumers_block
         return reason
 
     hostname = str(data.get('hostname') or _get_hostname())
@@ -762,10 +853,11 @@ def _format_health_degraded(data: Dict[str, Any],
     for item in categories:
         if not isinstance(item, dict):
             continue
+        item_reason = localized_reason(item).replace('\n', '\n  ')
         lines.append(runtime_message(
             'healthDegraded.multipleLine', language,
             severity=severity_label(item), category=category_label(item),
-            reason=localized_reason(item),
+            reason=item_reason,
         ))
     return title, '\n'.join(line for line in lines if line)
 
@@ -2145,6 +2237,14 @@ def render_template(event_type: str, data: Dict[str, Any],
             # recorded raw text as template placeholders a second time.
             variables['_temperature_fallback_body'] = '\n'.join(lines)
             template['body'] = '{_temperature_fallback_body}'
+
+    if event_type == 'cpu_high' and data.get('top_consumers'):
+        consumers_block = _format_cpu_consumers(data.get('top_consumers'), language=language)
+        if consumers_block:
+            existing_details = str(variables.get('details') or '').strip()
+            variables['details'] = (
+                f'{existing_details}\n{consumers_block}' if existing_details else consumers_block
+            )
 
     if event_type == 'lxc_update_applied' and isinstance(data.get('lxc_update'), dict):
         status = str(data['lxc_update'].get('status') or '')

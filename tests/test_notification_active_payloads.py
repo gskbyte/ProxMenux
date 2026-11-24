@@ -45,7 +45,7 @@ def extracted(path, name, cls=None, namespace=None):
 
 def render_fixture(language='en', overlays=None, missing=(), translations=None):
     catalogs = {lang: json.loads((MESSAGES / lang / 'common.json').read_text())['runtime']['notifications']
-                for lang in ('en', 'de', 'es', 'fr', 'it', 'pt', 'sk', 'sv')}
+                for lang in ('en', 'de', 'es', 'fr', 'it', 'pt', 'ru', 'sk', 'sv')}
     if language == 'synthetic':
         catalogs[language] = {'templates': {'temp_high': {
             'title': 'Synthetic {value}°C', 'body': 'Synthetic {threshold}°C\n{details}'}}}
@@ -83,6 +83,8 @@ def render_fixture(language='en', overlays=None, missing=(), translations=None):
                  '<safe formatting>', 'exec'), scope)
     extracted('notification_templates.py', '_catalog_value', namespace=scope)
     extracted('notification_templates.py', 'runtime_message', namespace=scope)
+    extracted('notification_templates.py', '_format_cpu_consumer_lines', namespace=scope)
+    extracted('notification_templates.py', '_format_cpu_consumers', namespace=scope)
     extracted('notification_templates.py', '_format_health_degraded', namespace=scope)
     render = extracted('notification_templates.py', 'render_template', namespace=scope)
     return lambda kind, data: render(kind, data, language=language)
@@ -496,6 +498,152 @@ class ActivePayloadTests(unittest.TestCase):
         self.assertIn('Utilizzo e temperatura CPU', multi['body'])
         self.assertIn('Servizi PVE', multi['body'])
         self.assertIn('Services inactive: pvedaemon', multi['body'])
+
+    def test_cpu_high_and_email_render_top_consumers_with_english_fallback(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('notification_channels_cpu_fixture',
+                                                     SCRIPTS / 'notification_channels.py')
+        channels = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(channels)
+
+        consumers = [
+            {'kind': 'vm', 'vmid': 100, 'name': 'ubuntu-docker', 'cpu_pct': 64.2},
+            {'kind': 'lxc', 'vmid': 108, 'name': 'plex', 'cpu_pct': 24.4,
+             'processes': [{'name': 'ffmpeg', 'cpu_pct': 21.1}]},
+            {'kind': 'host', 'name': 'zstd', 'cpu_pct': 6.0, 'count': 2},
+        ]
+        event = polled_event({
+            'error_key': 'cpu_usage',
+            'category': 'cpu',
+            'severity': 'WARNING',
+            'reason': 'CPU >85% sustained for 150s',
+            'details': {
+                'value': '94',
+                'cores': 16,
+                'threshold': 85,
+                'details': 'Sustained for 150s above 85%.',
+                'cpu_percent': 94.0,
+                'duration': 150,
+                'top_consumers': consumers,
+            },
+        })
+        self.assertEqual((event.event_type, event.severity), ('cpu_high', 'WARNING'))
+
+        old = sys.path[:]
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            channel = object.__new__(channels.EmailChannel)
+            channel.subject_prefix = '[ProxMenux]'
+            en_catalog = json.loads((MESSAGES / 'en' / 'common.json').read_text())['runtime']['notifications']
+            for lang in ('en', 'de', 'es', 'fr', 'it', 'pt', 'ru', 'sk', 'sv'):
+                catalog = json.loads((MESSAGES / lang / 'common.json').read_text())['runtime']['notifications']
+                expected_header = (catalog.get('cpu') or {}).get('topConsumers') or en_catalog['cpu']['topConsumers']
+                expected_host = (catalog.get('cpu') or {}).get('host') or en_catalog['cpu']['host']
+                expected_email_field = (
+                    catalog['channels']['email']['fields'].get('topConsumers')
+                    or en_catalog['channels']['email']['fields']['topConsumers']
+                )
+                with self.subTest(lang=lang):
+                    rendered = render_fixture(lang)('cpu_high', event.data)
+                    self.assertIn(expected_header, rendered['body'])
+                    self.assertIn('VM 100 (ubuntu-docker): 64%', rendered['body'])
+                    self.assertIn('CT 108 (plex): 24% (ffmpeg 21%)', rendered['body'])
+                    self.assertIn(f'{expected_host} (zstd ×2): 6%', rendered['body'])
+
+                    email_html = channel._format_html(
+                        rendered['title'], rendered['body'], 'WARNING',
+                        {**event.data, '_notification_language': lang,
+                         '_event_type': 'cpu_high', '_group': rendered['group']},
+                    )
+                    self.assertIn(html.escape(expected_email_field), email_html)
+                    self.assertIn('VM 100 (ubuntu-docker): 64%', email_html)
+                    self.assertIn('CT 108 (plex): 24% (ffmpeg 21%)', email_html)
+                    self.assertIn(html.escape(f'{expected_host} (zstd ×2): 6%'), email_html)
+        finally:
+            sys.path[:] = old
+
+    def test_health_collector_forwards_cpu_top_consumers_and_guards_braces_and_html(self):
+        import importlib.util
+        class Stop(Exception): pass
+        class Clock:
+            count = 0
+            def time(self): return 1.
+            def sleep(self, _):
+                self.count += 1
+                if self.count > 1: raise Stop
+        class Manager:
+            _enabled = True
+            _config = {}
+            events = []
+            def is_event_enabled(self, *_): return True
+            def emit_event(self, **kw): self.events.append(kw)
+
+        consumers = [
+            {'kind': 'vm', 'vmid': 101, 'name': 'vm{value.__class__}<b>', 'cpu_pct': 72.0},
+            {'kind': 'lxc', 'vmid': 109, 'name': 'ct{hostname}', 'cpu_pct': 18.0,
+             'processes': [{'name': 'proc{value}', 'cpu_pct': 15.0}]},
+        ]
+        manager = Manager()
+        scope = {
+            'notification_manager': manager, 'time': Clock(),
+            'startup_grace': types.SimpleNamespace(should_suppress_category=lambda *_: False),
+            '_capture_health_journal_context': lambda *_: '',
+            'resolve_notification_hostname': lambda name, *_: name,
+            'health_linked_event': health_linked_event(),
+            'health_monitor': types.SimpleNamespace(get_detailed_status=lambda: {
+                'hostname': 'node.example',
+                'details': {'cpu': {
+                    'status': 'WARNING',
+                    'reason': 'CPU >85% sustained for 300s',
+                    'top_consumers': consumers,
+                }},
+                'overall': 'WARNING', 'summary': 'x',
+            }, cached_results={}, last_check_times={}),
+        }
+        tree = ast.parse((SCRIPTS / 'flask_server.py').read_text())
+        fn = copy.deepcopy(next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_health_collector_loop'))
+        for node in ast.walk(fn):
+            for field, value in ast.iter_fields(node):
+                if isinstance(value, list):
+                    setattr(node, field, [child for child in value if not (
+                        isinstance(child, ast.ImportFrom) and child.module == 'health_monitor'
+                        or isinstance(child, ast.Import) and any(a.name == 'startup_grace' for a in child.names))])
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])), '<collector>', 'exec'), scope)
+        with self.assertRaises(Stop): scope['_health_collector_loop']()
+
+        payload = manager.events[0]['data']
+        out = render_fixture('en')('health_degraded', {**payload, 'severity': 'WARNING'})
+        self.assertIn('CPU is above 85% for 300s.', out['body'])
+        self.assertIn('Top consumers:', out['body'])
+        self.assertIn('VM 101 (vm{value.__class__}<b>): 72%', out['body'])
+        self.assertIn('CT 109 (ct{hostname}): 18% (proc{value} 15%)', out['body'])
+
+        # Email HTML must escape untrusted guest/process names and include Top Consumers row
+        spec = importlib.util.spec_from_file_location('notification_channels_hd_fixture',
+                                                     SCRIPTS / 'notification_channels.py')
+        channels = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(channels)
+        old = sys.path[:]
+        sys.path.insert(0, str(SCRIPTS))
+        try:
+            channel = object.__new__(channels.EmailChannel)
+            channel.subject_prefix = '[ProxMenux]'
+            email_html = channel._format_html(
+                out['title'], out['body'], 'WARNING',
+                {**payload, '_notification_language': 'en',
+                 '_event_type': 'health_degraded', '_group': out['group']},
+            )
+            self.assertIn('Top Consumers', email_html)
+            self.assertIn(html.escape('VM 101 (vm{value.__class__}<b>): 72%'), email_html)
+            self.assertNotIn('<b>)', email_html)
+        finally:
+            sys.path[:] = old
+
+        # Legacy cpu_high without top_consumers must not emit an empty header
+        legacy_cpu = render_fixture('en')('cpu_high', {
+            'hostname': 'node.example', 'value': '90', 'cores': 8, 'details': 'Sustained.',
+        })
+        self.assertNotIn('Top consumers', legacy_cpu['body'])
 
 
 if __name__ == '__main__':
